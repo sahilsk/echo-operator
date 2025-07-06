@@ -1,0 +1,12 @@
+[package]
+name = "echo-operator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+thiserror = "2.0.12"
+kube = { version = "1.1.0", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.25.0", features = ["latest"] }
+tokio = "1.46.1"
+tracing = "0.1.41"
