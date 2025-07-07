@@ -1,0 +1,7 @@
+apiVersion: sonukr.rs/v1
+kind: Echo
+metadata:
+  name: echo01
+spec:
+  message: 'ls -al '
+  count: 1
