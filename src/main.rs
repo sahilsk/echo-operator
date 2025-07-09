@@ -1,5 +1,5 @@
 use crate::echo::{Echo, EchoSpec};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -7,11 +7,11 @@ use k8s_openapi::{
     api::core::v1::{Container, PodSpec},
     apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 };
-use kube::runtime::watcher::Error;
+use kube::runtime::patcher::Error;
 use kube::{
     Client,
     api::{Api, PostParams},
-    runtime::{WatchStreamExt, watcher},
+    runtime::{WatchStreamExt, patcher},
 };
 use kube::{CustomResourceExt, ResourceExt};
 use serde::Serialize;
@@ -29,13 +29,16 @@ static CLIENT_NAME: &str = "kube.rs";
 #[derive(Error, Debug)]
 pub enum EchoOperatorError {
     #[error("Error watching for events {0}")]
-    KubeWatcherError(#[from] Error),
+    KubepatcherError(#[from] Error),
 
     #[error("Error kube api {0}")]
     TokioJoinError(#[from] JoinError),
 
     #[error("Error kube error {0}")]
     KubeError(#[from] kube::Error),
+
+    #[error("Resource already exist:{0}")]
+    AlreadyExists(String),
 
     #[error("Anyhow Error {0}")]
     AnyhowError(#[from] anyhow::Error),
@@ -52,7 +55,7 @@ pub enum EchoOperatorError {
 
 #[tokio::main]
 async fn main() -> Result<(), EchoOperatorError> {
-    let dry_run: bool = true;
+    let dry_run: bool = false;
     let client = Client::try_default().await?;
 
     let subscriber = FmtSubscriber::builder()
@@ -76,19 +79,19 @@ async fn main() -> Result<(), EchoOperatorError> {
      *******************/
     apply_crd(client.clone(), echo_crd.clone(), dry_run).await?;
 
-    // Create watcher
+    // Create patcher
     let jh = tokio::spawn(watch_echos(client.clone(), dry_run));
 
     // Create echo instance
     let echo_spec = EchoSpec {
-        message: "ls -al ".to_string(),
+        message: "curl google.com".to_string(),
         count: 1,
     };
 
     create_echo(client.clone(), echo_spec.clone(), dry_run).await?;
 
     /********************
-     * create watcher
+     * create patcher
      *******************/
 
     jh.await?
@@ -154,19 +157,25 @@ async fn apply_crd(
 
 async fn watch_echos(client: Client, dry_run: bool) -> Result<(), EchoOperatorError> {
     let echos: Api<Echo> = Api::namespaced(client.clone(), "default");
-    let echo_filter: watcher::Config = watcher::Config::default();
+    let echo_filter: patcher::Config = patcher::Config::default();
 
-    watcher(echos, echo_filter)
+    patcher(echos, echo_filter)
         .touched_objects()
-        .try_for_each(|p| async { process_echo(p, client.clone(), dry_run).await })
-        .await
-        .map_err(EchoOperatorError::KubeWatcherError)?;
+        .map_err(EchoOperatorError::KubepatcherError)
+        .try_for_each(|p| async { 
+            match process_echo(p, client.clone(), dry_run).await  {
+                Ok(k) => Ok(k),
+                Err(err) => Ok(())
+            }
+        })
+        .await?;
 
     Ok(())
 }
 
-// async fn process_echo(p: Echo) -> Result<(), watcher::Error> {
+// async fn process_echo(p: Echo) -> Result<(), patcher::Error> {
 async fn process_echo(p: Echo, client: Client, dry_run: bool) -> Result<(), EchoOperatorError> {
+    info!("Prcoessing echo: {:#?}", &p);
     info!("Name: {}", std::any::type_name_of_val(&p));
     info!(
         "Name: {}, Message: {},| Count: {}",
@@ -175,7 +184,12 @@ async fn process_echo(p: Echo, client: Client, dry_run: bool) -> Result<(), Echo
         p.spec.count
     );
 
-    create_job(client, dry_run, "default", "curl google.com".to_string()).await?;
+    if let Ok(jp) = create_job(client, dry_run, "default", p.spec.message).await {
+        info!("Job created successfully");
+    }else {
+        warn!("failed to create job");
+    }
+    
     Ok(())
 }
 
@@ -183,10 +197,10 @@ async fn create_echo(
     client: Client,
     echo_spec: EchoSpec,
     dry_run: bool,
-) -> Result<(), EchoOperatorError> {
-    // let echos: Api<Echo> = Api::default_namespaced(client);
+) -> Result<Echo, EchoOperatorError> {
     let echos: Api<Echo> = Api::namespaced(client, "default");
-    let echo_inst = Echo::new("echo01", echo_spec);
+    let echo_name = "echo01";
+    let echo_inst = Echo::new(echo_name, echo_spec);
 
     let pp = PostParams {
         dry_run,
@@ -195,22 +209,23 @@ async fn create_echo(
 
     info!("{}", serde_yaml::to_string(&echo_inst).unwrap());
     match echos.create(&pp, &echo_inst).await {
-        Ok(echo) => {
-            info!(name: "Resource:Echo", "Echo instance created: {:#?}", echo.metadata.name.unwrap());
+        Ok(echo_rsc) => {
+            let rsc_name  = echo_rsc.metadata.name.clone().unwrap();
+            info!(name: "Resource:Echo", "Echo instance created: {}", &rsc_name);
+            Ok(echo_rsc)
         }
-        Err(e) => match e {
-            kube::Error::Api(er) => {
-                if er.reason == "AlreadyExists" {
+        Err(err) => {
+            if let kube::Error::Api(ref kube_err) = err  {
+                if kube_err.reason == "AlreadyExists" {
                     warn!( name: "Resource:Echo", "Resource already exist:  '{}'", echo_inst.metadata.name.unwrap());
-                } else {
-                    warn!( name: "Resource:Echo",  "Error occurred: {:#?}", er);
+                    return Err(EchoOperatorError::AlreadyExists(echo_name.to_string()));
                 }
             }
-            _ => warn!( name: "Resource:Echo",  "Error occurred: {:#?}", e),
+            return Err(EchoOperatorError::KubeError(err));
+
         },
     }
 
-    Ok(())
 }
 
 async fn create_job(
@@ -220,6 +235,7 @@ async fn create_job(
     command: String,
 ) -> Result<Job, EchoOperatorError> {
     let jobs: Api<Job> = Api::namespaced(client, namespace);
+    let job_name = String::from("newjob01");
     let pp = PostParams {
         dry_run,
         field_manager: Some(CLIENT_NAME.into()),
@@ -233,16 +249,19 @@ async fn create_job(
         spec: Some(PodSpec {
             containers: vec![Container {
                 image: Some("curlimages/curl".to_string()),
+                name: job_name.clone(),
                 command: Some(vec![command]),
+                //Some(vec!["curl".into(), "google.com".into()]),
                 ..Default::default()
             }],
+            restart_policy: Some("Never".into()),
             ..Default::default()
         }),
     };
 
     let data = Job {
         metadata: ObjectMeta {
-            name: Some("new_job".to_string()),
+            name: Some("newjob01".to_string()),
             ..Default::default()
         },
         spec: Some(JobSpec {
@@ -252,7 +271,16 @@ async fn create_job(
         status: None,
     };
 
-    jobs.create(&pp, &data)
-        .await
-        .map_err(EchoOperatorError::KubeError)
+    match jobs.create(&pp, &data).await {
+        Ok(jp) => Ok(jp),
+        Err(err) => {
+            if let kube::Error::Api(ref e) = err {
+                if e.reason.contains("AlreadyExists") {
+                    warn!("Job with the name: {} already exist", job_name);
+                    return Err(EchoOperatorError::AlreadyExists(job_name));
+                }
+            };
+            Err(EchoOperatorError::KubeError(err))
+        }
+    }
 }
