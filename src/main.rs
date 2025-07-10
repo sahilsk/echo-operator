@@ -7,11 +7,11 @@ use k8s_openapi::{
     api::core::v1::{Container, PodSpec},
     apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 };
-use kube::runtime::patcher::Error;
+use kube::runtime::watcher::Error;
 use kube::{
     Client,
     api::{Api, PostParams},
-    runtime::{WatchStreamExt, patcher},
+    runtime::{WatchStreamExt, watcher},
 };
 use kube::{CustomResourceExt, ResourceExt};
 use serde::Serialize;
@@ -29,7 +29,7 @@ static CLIENT_NAME: &str = "kube.rs";
 #[derive(Error, Debug)]
 pub enum EchoOperatorError {
     #[error("Error watching for events {0}")]
-    KubepatcherError(#[from] Error),
+    KubeWatcherError(#[from] Error),
 
     #[error("Error kube api {0}")]
     TokioJoinError(#[from] JoinError),
@@ -79,7 +79,7 @@ async fn main() -> Result<(), EchoOperatorError> {
      *******************/
     apply_crd(client.clone(), echo_crd.clone(), dry_run).await?;
 
-    // Create patcher
+    // Create watcher
     let jh = tokio::spawn(watch_echos(client.clone(), dry_run));
 
     // Create echo instance
@@ -91,7 +91,7 @@ async fn main() -> Result<(), EchoOperatorError> {
     create_echo(client.clone(), echo_spec.clone(), dry_run).await?;
 
     /********************
-     * create patcher
+     * create watcher
      *******************/
 
     jh.await?
@@ -157,11 +157,11 @@ async fn apply_crd(
 
 async fn watch_echos(client: Client, dry_run: bool) -> Result<(), EchoOperatorError> {
     let echos: Api<Echo> = Api::namespaced(client.clone(), "default");
-    let echo_filter: patcher::Config = patcher::Config::default();
+    let echo_filter: watcher::Config = watcher::Config::default();
 
-    patcher(echos, echo_filter)
+    watcher(echos, echo_filter)
         .touched_objects()
-        .map_err(EchoOperatorError::KubepatcherError)
+        .map_err(EchoOperatorError::KubeWatcherError)
         .try_for_each(|p| async { 
             match process_echo(p, client.clone(), dry_run).await  {
                 Ok(k) => Ok(k),
@@ -173,7 +173,7 @@ async fn watch_echos(client: Client, dry_run: bool) -> Result<(), EchoOperatorEr
     Ok(())
 }
 
-// async fn process_echo(p: Echo) -> Result<(), patcher::Error> {
+// async fn process_echo(p: Echo) -> Result<(), watcher::Error> {
 async fn process_echo(p: Echo, client: Client, dry_run: bool) -> Result<(), EchoOperatorError> {
     info!("Prcoessing echo: {:#?}", &p);
     info!("Name: {}", std::any::type_name_of_val(&p));
